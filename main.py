@@ -8,8 +8,7 @@ from tensorflow.keras.models import Model
 from tensorflow.keras.optimizers import Adam
 import os
 
-csv_path = 'C:/Users/peter/OneDrive/Documents/GitHub/Dog_Classifier/dogs.csv'
-df = pd.read_csv(csv_path)
+df = pd.read_csv('dogs.csv')
 
 train_df = df[df['data set'] == 'train']
 val_df = df[df['data set'] == 'valid']
