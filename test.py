@@ -4,13 +4,11 @@ import torch.nn as nn
 import torch.optim as optim
 from torchvision import datasets, models, transforms
 from torch.utils.data import DataLoader, Dataset
-from torch.optim.lr_scheduler import ReduceLROnPlateau
 import os
 from PIL import Image
 
 # Load the dataset
 df = pd.read_csv('dogs.csv')
-
 
 # Map string labels to integers if necessary
 label_mapping = {label: idx for idx, label in enumerate(df['labels'].unique())}
@@ -91,34 +89,9 @@ model = model.to(device)
 # Define loss function and optimizer
 criterion = nn.CrossEntropyLoss()
 optimizer = optim.Adam(model.parameters(), lr=0.0001)
-scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3, verbose=True)
-
-# Early stopping class
-class EarlyStopping:
-    def __init__(self, patience=5, verbose=True):
-        self.patience = patience
-        self.verbose = verbose
-        self.counter = 0
-        self.best_loss = None
-        self.early_stop = False
-
-    def __call__(self, val_loss):
-        if self.best_loss is None or val_loss < self.best_loss:
-            self.best_loss = val_loss
-            self.counter = 0
-        else:
-            self.counter += 1
-            if self.verbose:
-                print(f"EarlyStopping counter: {self.counter} out of {self.patience}")
-            if self.counter >= self.patience:
-                self.early_stop = True
 
 # Training function
-def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler, num_epochs=20):
-    early_stopping = EarlyStopping(patience=5, verbose=True)
-    best_val_loss = float('inf')
-    best_model_path = 'best_model.pth'
-
+def train_model(model, train_loader, val_loader, criterion, optimizer, num_epochs=20):
     for epoch in range(num_epochs):
         model.train()
         running_loss = 0.0
@@ -167,25 +140,8 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
 
         print(f"Validation Loss: {val_epoch_loss:.4f}, Validation Accuracy: {val_epoch_acc:.4f}")
 
-        # Step scheduler
-        scheduler.step(val_epoch_loss)
-
-        # Early stopping check
-        early_stopping(val_epoch_loss)
-        if val_epoch_loss < best_val_loss:
-            best_val_loss = val_epoch_loss
-            torch.save(model.state_dict(), best_model_path)
-
-        if early_stopping.early_stop:
-            print("Early stopping triggered.")
-            break
-
-    print(f"Best model saved to {best_model_path}")
-    torch.save(model.state_dict(), 'final_model.pth')
-    print("Final model saved to final_model.pth")
-
 # Train the model
-train_model(model, train_loader, val_loader, criterion, optimizer, scheduler, num_epochs=20)
+train_model(model, train_loader, val_loader, criterion, optimizer, num_epochs=20)
 
 # Evaluate on test set
 def evaluate_model(model, test_loader):
@@ -205,6 +161,5 @@ def evaluate_model(model, test_loader):
     test_accuracy = test_correct / test_total
     print(f"Test Accuracy: {test_accuracy * 100:.2f}%")
 
-# Load the best model before testing
-model.load_state_dict(torch.load('best_model.pth'))
+# Evaluate the model
 evaluate_model(model, test_loader)
