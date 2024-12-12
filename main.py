@@ -1,16 +1,20 @@
 import pandas as pd
-import tensorflow as tf
-from tensorflow.keras.utils import load_img, img_to_array
-from tensorflow.keras.preprocessing.image import ImageDataGenerator
-from tensorflow.keras.applications import EfficientNetB0
-from tensorflow.keras.layers import Dense, GlobalAveragePooling2D, Dropout
-from tensorflow.keras.models import Model
-from tensorflow.keras.optimizers import Adam
-from tensorflow.keras.callbacks import ReduceLROnPlateau
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torchvision import datasets, models, transforms
+from torch.utils.data import DataLoader, Dataset
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 import os
+from PIL import Image
 
 # Load the dataset
 df = pd.read_csv('dogs.csv')
+
+
+# Map string labels to integers if necessary
+label_mapping = {label: idx for idx, label in enumerate(df['labels'].unique())}
+df['labels'] = df['labels'].map(label_mapping)
 
 # Split dataset into train, validation, and test sets
 train_df = df[df['data set'] == 'train']
@@ -22,73 +26,185 @@ print(f"Training samples: {len(train_df)}")
 print(f"Validation samples: {len(val_df)}")
 print(f"Testing samples: {len(test_df)}")
 
-image_size = (224, 224)  # Reduced image size for faster training
-batch_size = 16  # Reduced batch size
+image_size = (224, 224)  # Image size for resizing
+batch_size = 16  # Batch size
 
-# Initialize ImageDataGenerators for preprocessing
-datagen = ImageDataGenerator(
-    rescale=1.0 / 255,
-    rotation_range=15,  # Reduced augmentation range
-    width_shift_range=0.1,
-    height_shift_range=0.1,
-    zoom_range=0.1,
-    horizontal_flip=True
+# Custom dataset class
+class DogDataset(Dataset):
+    def __init__(self, dataframe, transform=None):
+        self.dataframe = dataframe
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.dataframe)
+
+    def __getitem__(self, idx):
+        img_path = self.dataframe.iloc[idx]['filepaths']
+        label = self.dataframe.iloc[idx]['labels']
+        image = Image.open(img_path).convert('RGB')
+
+        if self.transform:
+            image = self.transform(image)
+
+        # Convert label to tensor
+        label = torch.tensor(label)
+        return image, label
+
+# Data transformations
+transform = transforms.Compose([
+    transforms.Resize(image_size),
+    transforms.RandomHorizontalFlip(),
+    transforms.RandomRotation(15),
+    transforms.ToTensor(),
+    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+])
+
+# Create datasets and dataloaders
+train_dataset = DogDataset(train_df, transform=transform)
+val_dataset = DogDataset(val_df, transform=transform)
+test_dataset = DogDataset(test_df, transform=transform)
+
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+
+# Load pre-trained EfficientNetB0
+model = models.efficientnet_b0(pretrained=True)
+
+# Modify the classifier
+num_features = model.classifier[1].in_features
+model.classifier = nn.Sequential(
+    nn.Linear(num_features, 512),
+    nn.ReLU(),
+    nn.Dropout(0.3),
+    nn.Linear(512, 256),
+    nn.ReLU(),
+    nn.Dropout(0.3),
+    nn.Linear(256, len(train_df['labels'].unique())),  # Number of classes
+    nn.Softmax(dim=1)
 )
 
-# Function to create data generators from the DataFrame
-def create_generator(dataframe, datagen, image_size, batch_size):
-    return datagen.flow_from_dataframe(
-        dataframe=dataframe,
-        x_col="filepaths",
-        y_col="labels",
-        target_size=image_size,
-        batch_size=batch_size,
-        class_mode="categorical",
-        shuffle=True
-    )
+# Move model to GPU if available
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = model.to(device)
 
-# Create generators
-train_generator = create_generator(train_df, datagen, image_size, batch_size)
-val_generator = create_generator(val_df, datagen, image_size, batch_size)
-test_generator = create_generator(test_df, datagen, image_size, batch_size)
+# Define loss function and optimizer
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.Adam(model.parameters(), lr=0.0001)
+scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3, verbose=True)
 
-print("Training classes:", train_generator.class_indices.keys())
-print("Validation classes:", val_generator.class_indices.keys())
-print("Testing classes:", test_generator.class_indices.keys())
+# Early stopping class
+class EarlyStopping:
+    def __init__(self, patience=5, verbose=True):
+        self.patience = patience
+        self.verbose = verbose
+        self.counter = 0
+        self.best_loss = None
+        self.early_stop = False
 
-# Load pre-trained EfficientNetB0 and add classification layers
-base_model = EfficientNetB0(weights='imagenet', include_top=False, input_shape=(224, 224, 3))
+    def __call__(self, val_loss):
+        if self.best_loss is None or val_loss < self.best_loss:
+            self.best_loss = val_loss
+            self.counter = 0
+        else:
+            self.counter += 1
+            if self.verbose:
+                print(f"EarlyStopping counter: {self.counter} out of {self.patience}")
+            if self.counter >= self.patience:
+                self.early_stop = True
 
-# Add custom classification layers
-x = base_model.output
-x = GlobalAveragePooling2D()(x)
-x = Dense(512, activation='relu')(x)
-x = Dropout(0.3)(x)
-x = Dense(256, activation='relu')(x)
-x = Dropout(0.3)(x)
-predictions = Dense(len(train_generator.class_indices), activation='softmax')(x)
+# Training function
+def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler, num_epochs=20):
+    early_stopping = EarlyStopping(patience=5, verbose=True)
+    best_val_loss = float('inf')
+    best_model_path = 'best_model.pth'
 
-# Define the model
-model = Model(inputs=base_model.input, outputs=predictions)
+    for epoch in range(num_epochs):
+        model.train()
+        running_loss = 0.0
+        correct = 0
+        total = 0
 
-# Fine-tune by unfreezing top layers
-for layer in base_model.layers[-50:]:
-    layer.trainable = True
+        for images, labels in train_loader:
+            images, labels = images.to(device), labels.to(device)
 
-# Compile the model
-model.compile(optimizer=Adam(learning_rate=0.0001), loss='categorical_crossentropy', metrics=['accuracy'])
+            optimizer.zero_grad()
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
 
-# Define a learning rate scheduler
-lr_scheduler = ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=5, min_lr=1e-6)
+            running_loss += loss.item()
+            _, predicted = torch.max(outputs, 1)
+            correct += (predicted == labels).sum().item()
+            total += labels.size(0)
+
+        epoch_loss = running_loss / len(train_loader)
+        epoch_acc = correct / total
+
+        print(f"Epoch {epoch + 1}/{num_epochs}, Loss: {epoch_loss:.4f}, Accuracy: {epoch_acc:.4f}")
+
+        # Validation phase
+        model.eval()
+        val_loss = 0.0
+        val_correct = 0
+        val_total = 0
+
+        with torch.no_grad():
+            for images, labels in val_loader:
+                images, labels = images.to(device), labels.to(device)
+
+                outputs = model(images)
+                loss = criterion(outputs, labels)
+
+                val_loss += loss.item()
+                _, predicted = torch.max(outputs, 1)
+                val_correct += (predicted == labels).sum().item()
+                val_total += labels.size(0)
+
+        val_epoch_loss = val_loss / len(val_loader)
+        val_epoch_acc = val_correct / val_total
+
+        print(f"Validation Loss: {val_epoch_loss:.4f}, Validation Accuracy: {val_epoch_acc:.4f}")
+
+        # Step scheduler
+        scheduler.step(val_epoch_loss)
+
+        # Early stopping check
+        early_stopping(val_epoch_loss)
+        if val_epoch_loss < best_val_loss:
+            best_val_loss = val_epoch_loss
+            torch.save(model.state_dict(), best_model_path)
+
+        if early_stopping.early_stop:
+            print("Early stopping triggered.")
+            break
+
+    print(f"Best model saved to {best_model_path}")
+    torch.save(model.state_dict(), 'final_model.pth')
+    print("Final model saved to final_model.pth")
 
 # Train the model
-model.fit(
-    train_generator,
-    validation_data=val_generator,
-    epochs=20,
-    callbacks=[lr_scheduler]
-)
+train_model(model, train_loader, val_loader, criterion, optimizer, scheduler, num_epochs=20)
 
-# Evaluate the model on the test set
-test_loss, test_accuracy = model.evaluate(test_generator)
-print(f"Test Accuracy: {test_accuracy * 100:.2f}%")
+# Evaluate on test set
+def evaluate_model(model, test_loader):
+    model.eval()
+    test_correct = 0
+    test_total = 0
+
+    with torch.no_grad():
+        for images, labels in test_loader:
+            images, labels = images.to(device), labels.to(device)
+
+            outputs = model(images)
+            _, predicted = torch.max(outputs, 1)
+            test_correct += (predicted == labels).sum().item()
+            test_total += labels.size(0)
+
+    test_accuracy = test_correct / test_total
+    print(f"Test Accuracy: {test_accuracy * 100:.2f}%")
+
+# Load the best model before testing
+model.load_state_dict(torch.load('best_model.pth'))
+evaluate_model(model, test_loader)
