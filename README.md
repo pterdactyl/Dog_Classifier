@@ -10,8 +10,3 @@ The goal is to create a Dog Breed Classifier using a machine learning model that
 4.	Data Augmentation
 5.	Normalization
 
-## Approach
-- PyTorch
-- CNN architecture: Pre-trained model(EfficientNetB0)
-
----
